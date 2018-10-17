@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+import tensorflow as tf
+import os
+import time
+import sys
+import math
+import numpy as np
+from argparse import ArgumentParser
+from comet_ml import Experiment
+from nltk.tokenize.treebank import TreebankWordDetokenizer
+import models
+import config
+import dataUtils
+
+def _dataset_helper(path):
+	dataset = tf.data.TextLineDataset(path)
+	dataset = dataset.map(lambda line:tf.string_split([line]).values)	
+	dataset = dataset.map(lambda seq:tf.string_to_number(seq, tf.int32))
+	dataset = dataset.map(lambda seq:(seq, tf.size(seq)))
+	return dataset
+
+def create_dataset(enc_path, dec_input_path, dec_label_path):
+	enc_data = _dataset_helper(os.path.join(config.PROC_DIR, enc_path))
+	dec_input_data = _dataset_helper(os.path.join(config.PROC_DIR, dec_input_path))
+	dec_label_data = _dataset_helper(os.path.join(config.PROC_DIR, dec_label_path))
+	dataset = tf.data.Dataset.zip((enc_data, dec_input_data, dec_label_data))
+	return dataset
+
+def get_iterator(dataset):
+	dataset = dataset.shuffle(config.BUFFER_SIZE, reshuffle_each_iteration = True)
+	batched_dataset = dataset.padded_batch(config.BATCH_SIZE, (([None], []), ([None], []), ([None], [])), ((0, 0), (0, 0), (0, 0)))
+	return batched_dataset.make_initializable_iterator()
+
+def _check_restore_parameters(sess, saver, CPT_PATH):
+    ckpt = tf.train.get_checkpoint_state(CPT_PATH)
+    if ckpt and ckpt.model_checkpoint_path:
+        print("Loading parameters for the Translator")
+        saver.restore(sess, ckpt.model_checkpoint_path)
+    else:
+        print("Initializing fresh parameters for the Translator")
+
+def _get_skip_step(n):
+	# return 30 if n < 100 else 100
+	return 1 if n < 100 else 50
+
+def train(args, MODEL_PATH, CPT_PATH):
+	if args.upload:
+		experiment = Experiment(api_key="892XJc0Es5HPk76ojxcHda3zZ", project_name = args.upload)
+	train_log = open(os.path.join(MODEL_PATH, 'train.log'), 'a')
+	train_graph = tf.Graph()
+	src = args.mode[:2]
+	target = args.mode[-2:]
+	encode_vocab_size = config.JA_VOCAB_SIZE if src == 'ja' else config.EN_VOCAB_SIZE
+	decode_vocab_size = config.JA_VOCAB_SIZE if target == 'ja' else config.EN_VOCAB_SIZE
+	TRAIN_ENCODE = 'train.{}.src.ids'.format(src)
+	TRAIN_DECODE_INPUT = 'train.{}.target.input.ids'.format(target)
+	TRAIN_DECODE_LABEL = 'train.{}.target.label.ids'.format(target)
+	with train_graph.as_default():
+		# DATA PIPELINE
+		train_set = create_dataset(TRAIN_ENCODE, TRAIN_DECODE_INPUT, TRAIN_DECODE_LABEL)
+		train_iterator = get_iterator(train_set)
+		train_batch = train_iterator.get_next()
+		# BUILD MODEL
+		print('Building Training Model ...')
+		train_model = models.TrainingModel(encode_vocab_size, decode_vocab_size, train_batch)
+		# EPOCH NUMBER
+		n_epoch = tf.Variable(0, trainable = False, name = 'epoch_number')
+		update_epoch = n_epoch.assign_add(1)
+		train_saver = tf.train.Saver(max_to_keep = 100)
+		global_variables_initializer = tf.global_variables_initializer()
+	train_sess = tf.Session(graph = train_graph)
+	train_sess.run(global_variables_initializer)
+	_check_restore_parameters(train_sess, train_saver, CPT_PATH)
+
+	val_sess = None
+	if args.val:
+		val_graph = tf.Graph()
+		VAL_ENCODE = 'val.{}.src.ids'.format(src)
+		VAL_DECODE_INPUT = 'val.{}.target.input.ids'.format(target)
+		VAL_DECODE_LABEL = 'val.{}.target.label.ids'.format(target)
+		with val_graph.as_default():
+			# DATA_PIPELINE
+			val_set = create_dataset(VAL_ENCODE, VAL_DECODE_INPUT, VAL_DECODE_LABEL)
+			val_iterator = get_iterator(val_set)
+			val_batch = val_iterator.get_next()
+			# BUILD MODEL
+			print('Building Validation Model ...')
+			val_model = models.ValidationModel(encode_vocab_size, decode_vocab_size, val_batch)
+			val_saver = tf.train.Saver()
+		val_sess = tf.Session(graph = val_graph)
+	print('Start training ...')
+	while True:
+		try:
+			train_startTime = time.time()
+			train_sess.run(train_iterator.initializer)
+			epoch = train_sess.run(update_epoch)
+			train_model._update_learning_rate_by_epoch(train_sess, epoch)
+			n_train_batch = 0
+			total_train_loss = 0
+			while True:
+				try:					
+					loss, learning_rate, global_step = train_model.train(train_sess)
+					total_train_loss += loss
+					n_train_batch += 1
+				except tf.errors.OutOfRangeError:
+					break;
+			train_loss = total_train_loss/n_train_batch
+			#train_model._update_learning_rate_by_loss(train_sess, train_loss)
+			print('\nEpoch', epoch, 'Loss', train_loss, 'Duration', time.time() - train_startTime, 'Learning Rate', learning_rate, 'Number of batches', n_train_batch)
+			localtime = time.localtime(time.time())
+			train_log.write('Epoch {} Loss {} Learning_rate {} Time {}/{}/{} {}:{}:{}\n'.format(epoch, train_loss, learning_rate, localtime.tm_year, localtime.tm_mon, localtime.tm_mday, localtime.tm_hour, localtime.tm_min, localtime.tm_sec))
+			skip_step = _get_skip_step(epoch)
+			if epoch % skip_step == 0:
+				train_saver.save(train_sess, os.path.join(CPT_PATH, '{}epochs'.format(epoch)))
+				if args.val:
+					print('\nValidating...')
+					val_startTime = time.time()
+					_check_restore_parameters(val_sess, val_saver, CPT_PATH)
+					val_sess.run(val_iterator.initializer)
+					n_val_batch = 0
+					total_val_loss = 0
+					while True:
+						try:
+							loss = val_model.validate(val_sess)
+							total_val_loss += loss
+							n_val_batch += 1
+						except tf.errors.OutOfRangeError:
+							break
+					val_loss = total_val_loss/n_val_batch
+					perplexity = math.exp(val_loss)
+					print('Loss', val_loss, 'Perplexity', perplexity, 'Duration', time.time() - val_startTime, 'Number of batches', n_val_batch)
+					localtime = time.localtime(time.time())
+					train_log.write('VALIDATION: Loss {} Perplexity {} Time {}/{}/{} {}:{}:{}\n\n'.format(val_loss, perplexity, localtime.tm_year, localtime.tm_mon, localtime.tm_mday, localtime.tm_hour, localtime.tm_min, localtime.tm_sec))
+			if args.upload:
+				experiment.log_metric("loss", train_loss)
+				experiment.set_step(epoch)
+		except KeyboardInterrupt:
+			break
+	train_log.write('------------------------------------------------------------------------------------------------\n')
+	train_log.close()
+	train_sess.close()
+	if val_sess:
+		val_sess.close()
+
+
+def _get_user_input(src_lang):
+	print("{}> ".format(src_lang), end = "")
+	sys.stdout.flush()
+	return sys.stdin.readline()
+
+def _build_enc_input(user_input, vocab2id, tokenizer, rma):
+	ids = dataUtils._sentence2id(user_input, vocab2id, tokenizer, rma)
+	l = len(ids)
+	return ([ids], [l])
+
+def capitalize(s):
+	l = list(s)
+	l[0] = l[0].upper()
+	return ''.join(l)
+
+def _generate_translation(output_ids, detokenizer, id2vocab):
+	words = [id2vocab[i] for i in output_ids]
+	i = words.index('<EOS>') if '<EOS>' in words else len(words)
+	words = words[0:i]
+	translation = detokenizer.detokenize(words)
+	return capitalize(translation)
+
+
+def inference(args, MODEL_PATH, CPT_PATH):
+	src = args.mode[:2]
+	target = args.mode[-2:]
+	encode_vocab_size = config.JA_VOCAB_SIZE if src == 'ja' else config.EN_VOCAB_SIZE
+	decode_vocab_size = config.JA_VOCAB_SIZE if target == 'ja' else config.EN_VOCAB_SIZE
+	lang_dict = config.LANG_DICT
+	src_lang = lang_dict[src]
+	target_lang = lang_dict[target]
+	# BUILD MODEL
+	enc_input = tf.placeholder(dtype = tf.int32, shape = [1, None], name = "enc_input")
+	enc_input_len = tf.placeholder(dtype = tf.int32, shape = [1], name = "enc_input_len")
+	model = models.InferenceModel(args.infer, encode_vocab_size, decode_vocab_size, enc_input, enc_input_len)
+	# CREATE SAVER
+	saver = tf.train.Saver()
+	# CREATE OUPUT FILE
+	infer_log = open(os.path.join(MODEL_PATH, 'infer.log'), 'a')
+	infer_log.write(args.infer + '\n')
+	# UTILITIES
+	tokenizer, rma = dataUtils._get_tokenizer(src)
+	src_vocab2id = dataUtils._get_vocab2id('vocab.{}'.format(src))
+	id2target_vocab = dataUtils._get_id2vocab('vocab.{}'.format(target))
+	detokenizer = TreebankWordDetokenizer()
+	# SESSION
+	with tf.Session() as sess:
+		sess.run(tf.global_variables_initializer())
+		_check_restore_parameters(sess, saver, CPT_PATH)
+		print('{} - {} Translator'.format(src_lang, target_lang))
+		while True:
+			try:
+				user_input = _get_user_input(src_lang)
+				if len(user_input) > 0 and user_input[-1] == '\n':
+					user_input = user_input[:-1]
+				if user_input == '':
+					break
+				# infer_log.write('Japanese> ' + user_input + '\n')
+				infer_log.write('{}> {}\n'.format(src_lang, user_input))
+				input_ids, input_len = _build_enc_input(user_input, src_vocab2id, tokenizer, rma)
+				out_ids = model.infer(sess, input_ids, input_len)
+				translation = _generate_translation(out_ids, detokenizer, id2target_vocab)
+				print('{}> {}'.format(target_lang, translation))
+				# infer_log.write('English> ' + translation + '\n')
+				infer_log.write('{}> {}\n'.format(target_lang, translation))
+			except KeyboardInterrupt:
+				break
+	infer_log.write('-------------------------------------------------------------------------\n')
+	infer_log.close()
+
+def _copy_file(file_name, cur_path, new_path):
+	in_path = os.path.join(cur_path, file_name)
+	out_path = os.path.join(new_path, file_name)
+	if os.path.isfile(out_path):
+		return
+	else:
+		in_f = open(in_path, 'r')
+		out_f = open(out_path, 'w')
+		out_f.write(in_f.read())
+		for f in in_f, out_f:
+			f.close()
+
+def evaluate(args, MODEL_PATH, CPT_PATH):
+	src = args.mode[:2]
+	target = args.mode[-2:]
+	encode_vocab_size = config.JA_VOCAB_SIZE if src == 'ja' else config.EN_VOCAB_SIZE
+	decode_vocab_size = config.JA_VOCAB_SIZE if target == 'ja' else config.EN_VOCAB_SIZE
+	# lang_dict = config.LANG_DICT
+	# src_lang = lang_dict[src]
+	# target_lang = lang_dict[target]
+	_copy_file('test.en', config.RAW_DIR, MODEL_PATH)
+	_copy_file('test.ja', config.RAW_DIR, MODEL_PATH)
+	_copy_file('multi-bleu-detok.pl', config.RAW_DIR, MODEL_PATH)
+
+	with open(os.path.join(MODEL_PATH, 'test.{}'.format(src)), 'r') as in_f:
+		inputs = in_f.read().splitlines()
+	out_f = open(os.path.join(MODEL_PATH, '{}.{}'.format(args.eval, target)), 'w')
+	# BUILD MODEL
+	enc_input = tf.placeholder(dtype = tf.int32, shape = [1, None], name = "enc_input")
+	enc_input_len = tf.placeholder(dtype = tf.int32, shape = [1], name = "enc_input_len")
+	model = models.InferenceModel(args.eval, encode_vocab_size, decode_vocab_size, enc_input, enc_input_len)
+	# CREATE SAVER
+	saver = tf.train.Saver()
+	# UTILITIES
+	tokenizer, rma = dataUtils._get_tokenizer(src)
+	src_vocab2id = dataUtils._get_vocab2id('vocab.{}'.format(src))
+	id2target_vocab = dataUtils._get_id2vocab('vocab.{}'.format(target))
+	detokenizer = TreebankWordDetokenizer()
+	# SESSION
+	with tf.Session() as sess:
+		sess.run(tf.global_variables_initializer())
+		_check_restore_parameters(sess, saver, CPT_PATH)
+		for line in inputs:
+			input_ids, input_len = _build_enc_input(line, src_vocab2id, tokenizer, rma)
+			out_ids = model.infer(sess, input_ids, input_len)
+			translation = _generate_translation(out_ids, detokenizer, id2target_vocab)
+			out_f.write(translation + '\n')
+	out_f.close()
+	
+def create_model_dir(model_id, mode):
+	model_path = '{}.{}'.format(mode, model_id)
+	if os.path.isdir(model_path) == False:
+		dataUtils.make_dir(model_path)
+	cpt_path = os.path.join(model_path, 'checkpoints')
+	if os.path.isdir(cpt_path) == False:
+		dataUtils.make_dir(cpt_path)
+	print('Checkpoint directory:', cpt_path)
+	return model_path, cpt_path
+
+def check_config(model_id):
+	model_path = 'model.{}'.format(model_id)
+	if os.path.isdir(model_path) == False:
+		print('model.{} does not exist!'.format(model_id))
+	else:
+		config_path = os.path.join(model_path, 'config.txt')
+		if os.path.isfile(config_path) == False:
+			print(config_path, 'does not exist!')
+		else:
+			model_config = open(config_path, 'r')
+			main_config = open('config.py', 'r')
+			s0 = model_config.read()
+			s1 = main_config.read()
+			if s0 != s1:
+				print('Configuration conflicts')
+			for f in model_config, main_config:
+				f.close()
+
+if __name__ == "__main__":
+	parser = ArgumentParser()
+	parser.add_argument('--train', '-t', action='store_true')
+	parser.add_argument('--val', '-v', action='store_true')
+	parser.add_argument('--infer', '-i', choices=['greedy', 'beamsearch'])
+	parser.add_argument('--eval', '-e', choices=['greedy', 'beamsearch'])
+	parser.add_argument('--check', '-c', type=int)
+	parser.add_argument('--upload', '-u')
+	parser.add_argument('--model', '-d')
+	parser.add_argument('--mode', '-m', choices=['en-ja', 'ja-en'])
+	parser.add_argument('--preprocess', '-p', action='store_true')
+	parser.add_argument('--tokenize', '-k', action='store_true')
+	args = parser.parse_args()
+	if args.train or args.eval or args.infer:
+		assert args.model != None
+		assert args.mode != None
+		MODEL_PATH, CPT_PATH = create_model_dir(args.model, args.mode)
+	if args.train:
+		train(args, MODEL_PATH, CPT_PATH)
+	elif args.infer:
+		inference(args, MODEL_PATH, CPT_PATH)
+	elif args.eval:
+		evaluate(args, MODEL_PATH, CPT_PATH)
+	elif args.check:
+		print('Checking vocabulary...')
+		mc = args.check
+		dataUtils.embed_words(in_name = 'train.ja', lang='ja', min_count = mc, save = True)
+		dataUtils.embed_words(in_name = 'train.en', lang='en', min_count = mc, save = True)
+	elif args.tokenize:
+		make_dir(config.PROC_DIR)
+		print('Tokenizing data ...')
+		dataUtils.tokenize_data('train.ja', 'ja')
+		dataUtils.tokenize_data('train.en', 'en')
+		dataUtils.tokenize_data('val.ja', 'ja')
+		dataUtils.tokenize_data('val.en', 'en')
+	elif args.preprocess:
+		print('Building vocabulary ...')
+		dataUtils.build_vocab('ja')
+		dataUtils.build_vocab('en')
+
+		print('Adding special symbols...')
+		for f_name in 'train.ja', 'val.ja':
+			dataUtils.add_special_symbols(f_name, 'src', 'ja')
+		for f_name in 'train.en', 'val.en':
+			dataUtils.add_special_symbols(f_name, 'target', 'en')
+
+		for f_name in 'train.en', 'val.en':
+			dataUtils.add_special_symbols(f_name, 'src', 'en')
+		for f_name in 'train.ja', 'val.ja':
+			dataUtils.add_special_symbols(f_name, 'target', 'ja')
+
+		print('Converting to ids...')
+		for f_name in 'train.ja.src', 'val.ja.src':
+			dataUtils.build_id_encode_data(f_name, 'ja')
+		for f_name in 'train.ja.target', 'val.ja.target':
+			dataUtils.build_id_decode_data(f_name, 'input', 'ja')
+			dataUtils.build_id_decode_data(f_name, 'label', 'ja')
+
+		for f_name in 'train.en.src', 'val.en.src':
+			dataUtils.build_id_encode_data(f_name, 'en')
+		for f_name in 'train.en.target', 'val.en.target':
+			dataUtils.build_id_decode_data(f_name, 'input', 'en')
+			dataUtils.build_id_decode_data(f_name, 'label', 'en')
+
