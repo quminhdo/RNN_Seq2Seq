@@ -35,13 +35,10 @@ JESC_DATA_PARAMS = defaultdict(
 
 BASE_PARAMS = defaultdict(
     lambda:None,
-    data_dir = "sample",
-    bpe = False,
     pad_id = 0,
     go_id = 1,
     eos_id = 2,
     unk_id = 3,
-    extra_decode_length = 50,
     tokenize_method = "",
     beam_size=3,
     length_penalty_weight=0.5,
