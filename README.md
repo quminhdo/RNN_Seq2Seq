@@ -1,6 +1,6 @@
 # RNN_Seq2Seq
 ### 1. Introduction
-Implementation of a Sequence-to-Sequence model using Luong Attention and GNMT's Beam Search.
+Implementation of a Sequence-to-Sequence model using Luong Attention and [GNMT](https://arxiv.org/abs/1609.08144)'s Beam Search.
 
 Language pair: Japanese - English
 
