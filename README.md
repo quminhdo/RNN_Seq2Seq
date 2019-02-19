@@ -1,6 +1,6 @@
 # RNN_Seq2Seq
 ### 1. Introduction
-A Tensorflow implementation of a Sequence-to-Sequence model with Luong Attention and [GNMT](https://arxiv.org/abs/1609.08144)'s Beam Search.
+A Tensorflow implementation of a Sequence-to-Sequence model with [Luong Attention](https://arxiv.org/pdf/1508.04025.pdf) and [GNMT](https://arxiv.org/abs/1609.08144)'s Beam Search.
 
 Language pair: Japanese - English
 
