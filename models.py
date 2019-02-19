@@ -1,134 +1,318 @@
-import tensorflow as tf
 import os
-import numpy as np
-import pdb
-import dataUtils
+import time
+import tensorflow as tf
+import utils
 import config
-import modelHelper as helper
+from rnn_seq2seq import RNN_Seq2Seq
 
-class TrainingModel:
-	def __init__(self, encode_vocab_size, decode_vocab_size, data_batch):
-		phase = 'train'
-		enc_inputs = data_batch[0][0]
-		enc_input_lens = data_batch[0][1]
-		dec_inputs = data_batch[1][0]
-		dec_input_lens = data_batch[1][1]
-		dec_labels = data_batch[2][0]
-		# dec_label_lens = data_batch[2][1]
-		enc_embedder, dec_embedder = helper.build_embedders(encode_vocab_size, decode_vocab_size)
-		# OTHERS
-		self.global_step = tf.Variable(0, trainable = False)
-		self.learning_rate = tf.Variable(config.LEARNING_RATE_0, dtype = tf.float32, trainable = False, name = 'learning_rate')
-		self.lr1_op = self.learning_rate.assign(config.LEARNING_RATE_1)
-		self.lr2_op = self.learning_rate.assign(config.LEARNING_RATE_2)
-		self.lr3_op = self.learning_rate.assign(config.LEARNING_RATE_3)
-		self.lr4_op = self.learning_rate.assign(config.LEARNING_RATE_4)
-		self.lr5_op = self.learning_rate.assign(config.LEARNING_RATE_5)
-		self.lr6_op = self.learning_rate.assign(config.LEARNING_RATE_6)
-		self.decayed = tf.Variable(False, dtype = tf.bool, trainable = False, name = 'decayed')
-		self.decay_op = self.decayed.assign(True)
-		# EMBEDDING
-		enc_inputs = tf.nn.embedding_lookup(enc_embedder, enc_inputs)
-		dec_inputs = tf.nn.embedding_lookup(dec_embedder, dec_inputs)
-		# ENCODER
-		enc_outputs, enc_final_state = helper.build_encoder(phase, enc_inputs, enc_input_lens)
-		# DECODER
-		dec_outputs, dec_output_lens = helper.build_training_decoder(phase, decode_vocab_size, enc_outputs, enc_input_lens, enc_final_state, dec_embedder, dec_inputs, dec_input_lens)
-		# LOSS COMPUTATION
-		self.loss = helper.compute_loss(dec_output_lens, dec_labels, dec_outputs.rnn_output)
+class Training_Model:
+    def __init__(self, data_path, languages, model_path, graph):
+        self.model_params = config.MODEL_PARAMS
+        self.train_params = config.TRAIN_PARAMS
+        self.base_params = config.BASE_PARAMS
+        self.data_path = data_path
+        self.languages = languages
+        self.model_path = model_path
+        self.PAD = self.base_params["pad_id"]
+        self.GO = self.base_params["go_id"]
+        self.EOS = self.base_params["eos_id"]
+        self.UNK = self.base_params["unk_id"]
+        self.source_converter = self.get_converter(languages["source"])
+        self.target_converter = self.get_converter(languages["target"])
+        epoch = tf.get_variable(name="epoch", initializer=0, trainable=False)
+        self.update_epoch = tf.assign_add(epoch, 1)
+        self.learning_rate = self.train_params["learning_rate"] * tf.pow(tf.to_float(self.train_params["decay_rate"]), tf.to_float((epoch - 1) // self.train_params["decay_step"]))
+        self.sess = tf.Session(graph=graph)
+        # Prepare inputs and target outputs 
+        dataset = self.prepare_dataset()
+        self.iterator = self.get_iterator(dataset)
+        data_batch = self.iterator.get_next()
+        source_inputs, target_inputs, self.target_outputs = data_batch[0], data_batch[1], data_batch[2]
+        self.target_inputs = target_inputs
+        # Build model
+        vocab_size = self.get_vocab_size()
+        seq2seq = RNN_Seq2Seq(
+        vocab_size["source"], 
+        vocab_size["target"], 
+        self.model_params["embedding_dim"], 
+        self.model_params["cell_type"], 
+        self.model_params["rnn_dim"],
+        self.model_params["encoder_rnn_layer_num"],
+        self.model_params["bidirectional"],
+        self.model_params["decoder_rnn_layer_num"],
+        self.model_params["attention_dim"],
+        self.base_params["go_id"],
+        self.base_params["eos_id"],
+        self.base_params["pad_id"]
+        )
+        output_dict = seq2seq(source_inputs, target_inputs)
+        logits = output_dict["logits"]
+        self.outputs = output_dict["outputs"]
+        crossents = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.target_outputs, logits=logits)
+        batch_size = tf.to_float(tf.shape(logits)[0])
+        mask_weight = self.get_mask_weight()
+        self.loss = tf.reduce_sum(mask_weight*crossents)/batch_size
+        optimizer = tf.train.AdamOptimizer(self.learning_rate)
+        self.train_op = optimizer.minimize(self.loss)
+        # save and restore
+        self.saver = tf.train.Saver(max_to_keep=20)
+        self.sess.run(tf.tables_initializer())
+        self.check_restore_params()
 
-		# OPTIMIZER
-		variables = tf.trainable_variables()
-		print(len(variables))
-		print(variables)
-		gradients = tf.gradients(self.loss, variables)
-		clipped_gradients, _ = tf.clip_by_global_norm(gradients, config.MAX_GRAD_NORM)
-		optimizer = tf.train.AdamOptimizer(self.learning_rate)
-		self.train_op = optimizer.apply_gradients(zip(clipped_gradients, variables), global_step = self.global_step)
+    def __call__(self): 
+        self.sess.run(self.iterator.initializer)
+        total_loss = 0
+        epoch = self.sess.run(self.update_epoch)
+        n_batch = 0
+        while True:
+            try:
+                target_inputs, outputs, target_outputs, learning_rate, batch_loss, _ = self.sess.run((self.target_inputs, self.outputs, self.target_outputs, self.learning_rate, self.loss, self.train_op))
+                n_batch += 1
+                total_loss += batch_loss
+                #if n_batch % 10 == 1 and n_batch < 1000:
+                #    print("Batch {} loss {}".format(n_batch, batch_loss))
+            except tf.errors.OutOfRangeError:
+                log = "Epoch {}:\nTime: {}\nTraining loss: {}\nLearning rate: {}\n".format(epoch, time.asctime(time.localtime(time.time())), total_loss/n_batch, learning_rate)
+                print("No of batches:", n_batch)
+#                self.check_training(outputs, target_outputs, target_inputs)
+                self.saver.save(self.sess, os.path.join(self.model_path, "epoch_%d"%epoch))
+                break;
+        return log, epoch
 
+    def get_converter(self, language):
+        return utils.Word_Id_Converter(os.path.join(self.data_path, "vocab_{}".format(language)), self.UNK)
 
-	def _update_learning_rate_by_loss(self, sess, loss):
-		if loss < 2 and loss > 1:
-			sess.run(self.lr1_op)
-		if loss < 0.5 and loss > 0.1:
-			sess.run(self.lr2_op)
-		if loss < 0.02 and loss > 0.01:
-			sess.run(self.lr3_op)
-		if loss < 0.01 and loss > 0.005:
-			sess.run(self.lr4_op)
+    def get_mask_weight(self):
+        unpadded_pos = tf.cast(tf.not_equal(self.target_outputs, self.PAD), tf.float32) 
+        return unpadded_pos
 
-	def _update_learning_rate_by_epoch(self, sess, epoch):
-		if epoch > 22:
-			sess.run(self.lr6_op)
-		if epoch > 19 and epoch <= 22:
-			sess.run(self.lr5_op)
-		if epoch > 16 and epoch <= 19:
-			sess.run(self.lr4_op)
-		if epoch > 13 and epoch <= 16:
-			sess.run(self.lr3_op)
-		if epoch > 10 and epoch <= 13:
-			sess.run(self.lr2_op)
-		if epoch > 7 and epoch <= 10:
-			sess.run(self.lr1_op)
-		pass
+    def check_training(self, output, target, inputs=None):
+        if inputs is not None:
+            print("Input:")
+            print(inputs)
+        print("Output:")
+        print(output)
+        print("Target:")
+        print(target)
 
-	def _decay_learning_rate(self, sess, loss):
-		if loss < 3 and self.decayed.eval() == False:
-			self.learning_rate = tf.train.exponential_decay(learning_rate = config.LEARNING_RATE_0, global_step = self.global_step, decay_steps = config.DECAY_STEPS, decay_rate = config.DECAY_RATE)
-			sess.run(self.decay_op)
+    def get_vocab_size(self):
+        vocab_size = {}
+        for key, value in self.languages.items():
+            vocab_size[key] = utils.get_file_size(os.path.join(self.data_path, "vocab_{}".format(value)))
+        return vocab_size
+    
+    def check_restore_params(self):
+        ckpt = tf.train.get_checkpoint_state(self.model_path)
+        if ckpt and ckpt.model_checkpoint_path:
+            self.saver.restore(self.sess, ckpt.model_checkpoint_path)
+        else:
+            print("Initializing parameters...")
+            self.sess.run(tf.global_variables_initializer())
+         
+    def prepare_dataset(self):
+        source_data_file = os.path.join(self.data_path, "train_{}".format(self.languages["source"]))
+        target_data_file = os.path.join(self.data_path, "train_{}".format(self.languages["target"]))
+        return utils.prepare_dataset(source_data_file, target_data_file, self.source_converter, self.target_converter, self.GO, self.EOS, self.UNK)
 
-	def train(self, sess):
-		learning_rate = sess.run(self.learning_rate)
-		loss, _, global_step= sess.run((self.loss, self.train_op, self.global_step))
-		return loss, learning_rate, global_step
+    def get_iterator(self, dataset):
+        with tf.device("/cpu:0"):
+            pad_value = tf.cast(self.PAD, tf.int32)
+            dataset = dataset.shuffle(4000000, seed=0, reshuffle_each_iteration=True)
+            dataset = dataset.padded_batch(self.train_params["batch_size"], ([None], [None], [None]), (pad_value, pad_value, pad_value), drop_remainder=False)
+            return dataset.make_initializable_iterator()
 
-class ValidationModel:
-	def __init__(self, encode_vocab_size, decode_vocab_size, data_batch):
-		phase = 'validate'
-		enc_inputs = data_batch[0][0]
-		enc_input_lens = data_batch[0][1]
-		dec_inputs = data_batch[1][0]
-		dec_input_lens = data_batch[1][1]
-		dec_labels = data_batch[2][0]
-		# dec_label_lens = data_batch[2][1]
-		enc_embedder, dec_embedder = helper.build_embedders(encode_vocab_size, decode_vocab_size)
-		# EMBEDDING
-		enc_inputs = tf.nn.embedding_lookup(enc_embedder, enc_inputs)
-		dec_inputs = tf.nn.embedding_lookup(dec_embedder, dec_inputs)
-		# ENCODER
-		enc_outputs, enc_final_state = helper.build_encoder(phase, enc_inputs, enc_input_lens)
-		# DECODER
-		# if decoder_type == 'beamsearch':
-		# 	dec_outputs, dec_output_lens = helper.build_beamsearch_decoder(phase, enc_outputs, enc_input_lens, enc_final_state, dec_embedder)
-		dec_outputs, dec_output_lens = helper.build_training_decoder(phase, decode_vocab_size, enc_outputs, enc_input_lens, enc_final_state, dec_embedder, dec_inputs, dec_input_lens)
-		# LOSS COMPUTATION
-		self.loss = helper.compute_loss(dec_output_lens, dec_labels, dec_outputs.rnn_output)
+    def update_epoch(self):
+        return self.sess.run(tf.assign_add(self.epoch, 1))
 
-	def validate(self, sess):
-		loss = sess.run((self.loss))
-		return loss
+class Validating_Model:
+    def __init__(self, data_path, languages, model_path, graph):
+        self.model_params = config.MODEL_PARAMS
+        self.base_params = config.BASE_PARAMS
+        self.data_path = data_path
+        self.languages = languages
+        self.model_path = model_path
+        self.PAD = self.base_params["pad_id"]
+        self.GO = self.base_params["go_id"]
+        self.EOS = self.base_params["eos_id"]
+        self.UNK = self.base_params["unk_id"]
+        self.source_converter = self.get_converter(languages["source"])
+        self.target_converter = self.get_converter(languages["target"])
+        self.sess = tf.Session(graph=graph)
+        # Prepare data 
+        dataset = self.prepare_dataset()
+        self.iterator = self.get_iterator(dataset)
+        data_batch = self.iterator.get_next()
+        source_inputs, target_inputs, self.target_outputs = data_batch[0], data_batch[1], data_batch[2]
+        # Build model
+        vocab_size = self.get_vocab_size()
+        seq2seq = RNN_Seq2Seq(
+        vocab_size["source"], 
+        vocab_size["target"], 
+        self.model_params["embedding_dim"], 
+        self.model_params["cell_type"], 
+        self.model_params["rnn_dim"],
+        self.model_params["encoder_rnn_layer_num"],
+        self.model_params["bidirectional"],
+        self.model_params["decoder_rnn_layer_num"],
+        self.model_params["attention_dim"],
+        self.base_params["go_id"],
+        self.base_params["eos_id"],
+        self.base_params["pad_id"]
+        )
+        output_dict = seq2seq(source_inputs, target_inputs)
+        logits = output_dict["logits"]
+        crossents = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.target_outputs, logits=logits)
+        batch_size = tf.to_float(tf.shape(logits)[0])
+        mask_weight = self.get_mask_weight()
+        self.loss = tf.reduce_sum(mask_weight*crossents)/batch_size
+        # Save and restore
+        self.saver = tf.train.Saver()
+        self.sess.run(tf.tables_initializer())
 
-class InferenceModel:
-	def __init__ (self, decoder_type, encode_vocab_size, decode_vocab_size, enc_input, enc_input_len):
-		phase = 'infer'
-		self.enc_input = enc_input
-		self.enc_input_len = enc_input_len
-		enc_embedder, dec_embedder = helper.build_embedders(encode_vocab_size, decode_vocab_size)
-		# EMBEDDING_LAYER
-		enc_input = tf.nn.embedding_lookup(enc_embedder, self.enc_input)
-		# ENCODER
-		enc_output, enc_final_state = helper.build_encoder(phase, enc_input, enc_input_len)
-		# DECODER
-		if decoder_type == 'beamsearch':
-			dec_output, dec_output_len = helper.build_beamsearch_decoder(phase, decode_vocab_size, enc_output, enc_input_len, enc_final_state, dec_embedder)
-			dec_output_ids = tf.squeeze(dec_output.predicted_ids)
-			dec_output_ids = tf.transpose(dec_output_ids)
-			self.output_id = dec_output_ids[0]
-		else:
-			dec_output, dec_output_len = helper.build_greedy_decoder(phase, decode_vocab_size, enc_output, enc_input_len, enc_final_state, dec_embedder)
-			dec_output_id = dec_output.sample_id
-			self.output_id = tf.squeeze(dec_output_id)
+    def __call__(self): 
+        self.restore_params()
+        self.sess.run(self.iterator.initializer)
+        total_loss = 0
+        n_batch = 0
+        while True:
+            try:
+                batch_loss = self.sess.run((self.loss))
+                total_loss += batch_loss
+                n_batch += 1
+            except tf.errors.OutOfRangeError:
+                log = "Validation loss: {}\n".format(total_loss/n_batch)
+                break;
+        return log
 
-	def infer(self, sess, input_ids, input_len):
-		output_id = sess.run(self.output_id, feed_dict = {self.enc_input:input_ids, self.enc_input_len:input_len})
-		return output_id
+    def get_converter(self, language):
+        return utils.Word_Id_Converter(os.path.join(self.data_path, "vocab_{}".format(language)), self.UNK)
+
+    def get_mask_weight(self):
+        unpadded_pos = tf.cast(tf.not_equal(self.target_outputs, self.PAD), tf.float32) 
+        return unpadded_pos
+
+    def get_vocab_size(self):
+        vocab_size = {}
+        for key, value in self.languages.items():
+            vocab_size[key] = utils.get_file_size(os.path.join(self.data_path, "vocab_{}".format(value)))
+        return vocab_size
+
+    def restore_params(self):
+        ckpt = tf.train.get_checkpoint_state(self.model_path)
+        if ckpt and ckpt.model_checkpoint_path:
+            self.saver.restore(self.sess, ckpt.model_checkpoint_path)
+        else:
+            print("No saved parameters found")
+         
+    def prepare_dataset(self):
+        source_data_file = os.path.join(self.data_path, "validate_{}".format(self.languages["source"]))
+        target_data_file = os.path.join(self.data_path, "validate_{}".format(self.languages["target"]))
+        return utils.prepare_dataset(source_data_file, target_data_file, self.source_converter, self.target_converter, self.GO, self.EOS, self.UNK)
+
+    def get_iterator(self, dataset):
+        pad_id = tf.cast(self.PAD, tf.int32)
+        dataset = dataset.padded_batch(32, ([None], [None], [None]), (pad_id, pad_id, pad_id), drop_remainder=False)
+        return dataset.make_initializable_iterator()
+
+class Inference_Model:
+    def __init__(self, data_path, languages, model_path):
+        self.model_params = config.MODEL_PARAMS
+        self.base_params = config.BASE_PARAMS
+        self.data_path = data_path
+        self.languages = languages
+        self.model_path = model_path
+        self.PAD = self.base_params["pad_id"]
+        self.GO = self.base_params["go_id"]
+        self.EOS = self.base_params["eos_id"]
+        self.UNK = self.base_params["unk_id"]
+        self.tokenizer = self.get_tokenizer()
+        self.detokenizer = self.get_detokenizer()
+        self.source_converter = self.get_converter(languages["source"])
+        self.target_converter = self.get_converter(languages["target"])
+        self.sess = tf.Session()
+        # Input
+        self.input_holder = tf.placeholder(tf.string, [None, None])
+        inputs = self.source_converter.word2id(self.input_holder)
+        # Build model
+        vocab_size = self.get_vocab_size()
+        seq2seq = RNN_Seq2Seq(
+        vocab_size["source"], 
+        vocab_size["target"], 
+        self.model_params["embedding_dim"], 
+        self.model_params["cell_type"], 
+        self.model_params["rnn_dim"],
+        self.model_params["encoder_rnn_layer_num"],
+        self.model_params["bidirectional"],
+        self.model_params["decoder_rnn_layer_num"],
+        self.model_params["attention_dim"],
+        self.base_params["go_id"],
+        self.base_params["eos_id"],
+        self.base_params["pad_id"]
+        )
+#        output_dict = seq2seq(inputs)
+        output_dict = seq2seq(inputs, length_penalty_weight=self.base_params["length_penalty_weight"], coverage_penalty_weight=self.base_params["coverage_penalty_weight"], beam_size=self.base_params["beam_size"])
+        fed_inputs = output_dict["fed_inputs"]
+        self.alignments = output_dict["alignments"]
+        outputs = output_dict["outputs"]
+        self.outputs = self.target_converter.id2word(outputs)
+        self.fed_inputs = self.target_converter.id2word(fed_inputs)
+        # Save and restore
+        self.saver = tf.train.Saver()
+        self.sess.run(tf.tables_initializer())
+        self.restore_params()
+
+    def __call__(self, inputs): 
+        tokenized_inputs = self.process_inputs(inputs)
+#        print(tokenized_inputs)
+        outputs, fed_inputs, alignments = self.sess.run((self.outputs, self.fed_inputs, self.alignments), feed_dict={self.input_holder:tokenized_inputs})
+#        self.check_inference(id_inputs, id_outputs)
+        outputs, tokenized_outputs = self.process_output(outputs)
+#        _, tokenized_fed_inputs = self.process_output(fed_inputs)
+#        print(tokenized_fed_inputs)
+        return outputs, tokenized_inputs, tokenized_outputs, alignments
+
+    def check_inference(self, id_inputs, id_outputs):
+        print("ID inputs")
+        print(id_inputs)
+        print("ID outputs")
+        print(id_outputs)
+
+    def get_tokenizer(self):
+        if self.languages["source"] in ["en"]:
+            return utils.English_Tokenizer()
+        if self.languages["source"] == "ja":
+            return utils.Japanese_Tokenizer()
+
+    def get_detokenizer(self):
+        if self.languages["target"] in ["en"]:
+            return utils.English_Detokenizer()
+        if self.languages["target"] == "ja":
+            return utils.Japanese_Detokenizer()
+        
+    def get_converter(self, language):
+        return utils.Word_Id_Converter(os.path.join(self.data_path, "vocab_{}".format(language)), self.UNK)
+
+    def get_vocab_size(self):
+        vocab_size = {}
+        for key, value in self.languages.items():
+            vocab_size[key] = utils.get_file_size(os.path.join(self.data_path, "vocab_{}".format(value)))
+        return vocab_size
+
+    def process_inputs(self, inputs): # list of text
+        tokens_list = self.tokenizer(inputs)
+        return tokens_list
+
+    def process_output(self, outputs):
+        outputs = outputs.tolist()
+        tokenized_outputs = [list(map(lambda byte: byte.decode("utf-8"), seq)) for seq in outputs]
+        outputs = self.detokenizer(tokenized_outputs)
+        outputs = [output[:output.find(" <EOS>")] for output in outputs]
+        return outputs, tokenized_outputs # list of text
+
+    def restore_params(self):
+        ckpt = tf.train.get_checkpoint_state(self.model_path)
+        if ckpt and ckpt.model_checkpoint_path:
+            print("Restoring trained parameters...")
+            self.saver.restore(self.sess, ckpt.model_checkpoint_path)
+        else:
+            print("No saved parameters found")

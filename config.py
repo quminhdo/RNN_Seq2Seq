@@ -1,53 +1,49 @@
-# Model configuration
-ENCODER_CELL_TYPE = 'norm_lstm'
-ENCODER_LAYERS = 2
-ENCODER_BI_LAYERS = 1
-DECODER_CELL_TYPE = 'norm_lstm'
-DECODER_LAYERS = 2
-EMBEDDING_DIM = 512
-HIDDEN_SIZE = 512
-ATTENTION_SIZE = 512
-USE_TRAINED_EMBEDDING = False
-PASS_STATE = True
-COMMON_FINAL_STATE = False
-ATTENTION = 'bahdanau'
-DROPOUT = 0.2
-MAX_GRAD_NORM = 5.0
-TIME_MAJOR = False
-LAYER_NORM = False
-NORMALIZE = False
-DECODER = 'baseline'
-APPLY_ATTENTION_TO_ALL = False
-CONCATENATE = True
-STDDEV = 1.0
+from collections import defaultdict
 
-# Training configuration
-NUM_SAMPLED = 0
-BATCH_SIZE = 100
-LEARNING_RATE_0 = 0.004
-LEARNING_RATE_1 = 0.002
-LEARNING_RATE_2 = 0.001
-LEARNING_RATE_3 = 0.0005
-LEARNING_RATE_4 = 0.00025
-LEARNING_RATE_5 = 0.0001
-LEARNING_RATE_6 = 0.00005
-DECAY_STEPS = 17000
-DECAY_RATE = 0.5
-BUFFER_SIZE = 4000000
+MODEL_PARAMS = defaultdict(
+    lambda:None,
+    embedding_dim = 512,
+    cell_type = "lstm",
+    rnn_dim = 512,
+    encoder_rnn_layer_num = 3,
+    bidirectional = False,
+    decoder_rnn_layer_num = 3,
+    attention_dim = 512
+)
 
-# Inference configuration
-MAX_LENGTH = 50
-BEAM_WIDTH = 10
-LENGTH_PENALTY = 1.0
+TRAIN_PARAMS = defaultdict(
+    lambda:None,
+    learning_rate = 0.001,
+    batch_size = 32,
+    decay_rate = 0.5,
+    decay_step = 100,
+)
 
-# Data processing configuration
-RAW_DIR = 'partitioned'
-PROC_DIR = 'processed'
-INFER_OUTPUT = 'infer.log'
-CPT_DIR = 'checkpoints'
-LANG_DICT = {'ja':'Japanese', 'en':'English'}
-WORD_NUM = 0
-DIV_RATE = 0.1
+IKNOW_DATA_PARAMS = defaultdict(
+    lambda : None,
+    data_path = "iknow",
+    validate_size = 1500,
+    vocab_en_threshold = 2,
+    vocab_ja_threshold = 2,
+)
 
-JA_VOCAB_SIZE = 46088
-EN_VOCAB_SIZE = 35586
+JESC_DATA_PARAMS = defaultdict(
+    lambda : None,
+    vocab_en_threshold = 10,
+    vocab_ja_threshold = 10,
+)
+
+BASE_PARAMS = defaultdict(
+    lambda:None,
+    data_dir = "sample",
+    bpe = False,
+    pad_id = 0,
+    go_id = 1,
+    eos_id = 2,
+    unk_id = 3,
+    extra_decode_length = 50,
+    tokenize_method = "",
+    beam_size=3,
+    length_penalty_weight=0.5,
+    coverage_penalty_weight=0.5,
+)
