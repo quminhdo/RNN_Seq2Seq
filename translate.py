@@ -13,12 +13,12 @@ def change_font(text_list, font):
     for text in text_list:
         text.set_font_properties(font)
 
-def plot_alignments(source_words_list, target_words_list, alignments):
-    font = font_manager.FontProperties(fname="/home/minh/je.translator/IPAfont00303/ipag.ttf")
+def plot_attention_weights(source_words_list, target_words_list, attention_weights):
+    font = font_manager.FontProperties(fname="ipag.ttf")
     for i in range(len(source_words_list)):
         source_words = source_words_list[i]
         target_words = target_words_list[i]
-        alignment = alignments[i]
+        alignment = attention_weights[i]
         fig, ax = plt.subplots()
         im = ax.imshow(alignment)
         ax.set_xticks(np.arange(len(source_words)))
@@ -50,9 +50,9 @@ if __name__ == "__main__":
             if inputs == "":
                 print("Invalid input. Please try again")
                 continue
-            outputs, tokenized_inputs, tokenized_outputs, alignments = translate([inputs])
+            outputs, tokenized_inputs, tokenized_outputs, attention_weights = translate([inputs])
             print("{} translation:".format(LANG_DICT[languages["target"]]), ' '.join(outputs))
-            plot_alignments(tokenized_inputs, tokenized_outputs, alignments)
+            plot_attention_weights(tokenized_inputs, tokenized_outputs, attention_weights)
         except KeyboardInterrupt:
             print("\nSee you later.")
             break;

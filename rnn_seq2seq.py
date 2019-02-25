@@ -1,7 +1,5 @@
 import tensorflow as tf
-import os
 import layers
-import config
 
 class RNN_Seq2Seq:
     def __init__(self, 
@@ -34,10 +32,10 @@ class RNN_Seq2Seq:
         encoder_outputs, encoder_states = self.encode(source_id_seqs)
         if target_id_seqs is None:
             if beam_size is None:
-                fed_inputs, alignments, outputs  = self.greedy_decode(encoder_outputs, encoder_states, attention_mask)
+                fed_inputs, attention_weights, outputs  = self.greedy_decode(encoder_outputs, encoder_states, attention_mask)
             else:
-                fed_inputs, alignments, outputs = self.beam_search_decode(encoder_outputs, encoder_states, attention_mask, beam_size, coverage_penalty_weight, length_penalty_weight)
-            output_dict = {"fed_inputs": fed_inputs, "alignments": alignments, "outputs": outputs}
+                fed_inputs, attention_weights, outputs = self.beam_search_decode(encoder_outputs, encoder_states, attention_mask, beam_size, coverage_penalty_weight, length_penalty_weight)
+            output_dict = {"fed_inputs": fed_inputs, "attention_weights": attention_weights, "outputs": outputs}
         else:
             logits, outputs = self.decode_with_teacher_forcing(encoder_outputs, encoder_states, target_id_seqs, attention_mask)
             output_dict = {"logits": logits, "outputs": outputs}
@@ -53,7 +51,7 @@ class RNN_Seq2Seq:
         sequence_length = self.get_sequence_length(id_seqs)
         inputs = self.target_embedding_layer(id_seqs)
         outputs, states = self.decoder(inputs, sequence_length)
-        outputs, alignments = self.attention_layer(encoder_outputs, outputs, attention_mask) # shape [batch_size, decoder_max_len, 2*rnn_dim]
+        outputs, attention_weights = self.attention_layer(encoder_outputs, outputs, attention_mask) # shape [batch_size, decoder_max_len, 2*rnn_dim]
         outputs = self.projection_layer(outputs) # shape [batch_size, decoder_max_len, embedding_dim]
         logits = self.target_embedding_layer.linear(outputs) # shape [batch_size, decoder_max_len, target_vocab_size]
         outputs = tf.argmax(tf.nn.softmax(logits), axis=-1, output_type=tf.int32)
@@ -65,7 +63,7 @@ class RNN_Seq2Seq:
         MAX_LENGTH = encode_length + extra_decode_length
         initial_variables = {
             "ID_SEQS" : tf.fill([batch_size, 1], self.GO),
-            "ALIGNMENTS": tf.zeros([batch_size, 1, encode_length]),
+            "ATTENTION_WEIGHTS": tf.zeros([batch_size, 1, encode_length]),
             "OUTPUTS" : tf.zeros([batch_size, 1], tf.int32),
             "FINISHED" : tf.zeros([batch_size], tf.int32),
             "INDEX" : tf.constant(0)
@@ -74,15 +72,15 @@ class RNN_Seq2Seq:
         encode_length_dim = encoder_outputs.shape[1]
         variables_shape = {
             "ID_SEQS" : tf.TensorShape([batch_size_dim, None]),
-            "ALIGNMENTS" : tf.TensorShape([batch_size_dim, None, encode_length_dim]),
+            "ATTENTION_WEIGHTS" : tf.TensorShape([batch_size_dim, None, encode_length_dim]),
             "OUTPUTS": tf.TensorShape([batch_size_dim, None]),
             "FINISHED": tf.TensorShape([batch_size_dim]),
             "INDEX": tf.TensorShape([]) 
         }
-        def continue_decode(fed_inputs, alignments, outputs, finished, i):
+        def continue_decode(fed_inputs, attention_weights, outputs, finished, i):
             return tf.logical_and(tf.less(tf.reduce_sum(finished), tf.size(finished)), tf.less(tf.shape(outputs)[1], MAX_LENGTH))
 
-        def step(fed_inputs, alignments, outputs, finished, i):
+        def step(fed_inputs, attention_weights, outputs, finished, i):
             i += 1
             cur_outputs = outputs[:, -1] # shape [batch_size]
             next_ids = (1 - finished) * cur_outputs + finished * self.EOS
@@ -90,16 +88,16 @@ class RNN_Seq2Seq:
             sequence_length = self.get_sequence_length(fed_inputs)
             inputs = self.target_embedding_layer(fed_inputs)
             decoder_outputs, states = self.decoder(inputs, sequence_length)
-            attention_layer_outputs, alignments = self.attention_layer(encoder_outputs, decoder_outputs, attention_mask) # shape [batch_size, decoder_cur_len, 2*rnn_dim]
+            attention_layer_outputs, attention_weights = self.attention_layer(encoder_outputs, decoder_outputs, attention_mask) # shape [batch_size, decoder_cur_len, 2*rnn_dim]
             projected_outputs = self.projection_layer(attention_layer_outputs) # shape [batch_size, decoder_cur_len, embedding_dim]
             logits = self.target_embedding_layer.linear(projected_outputs) # shape [batch_size, decoder_cur_len, target_vocab_size]
             outputs = tf.argmax(tf.nn.softmax(logits), axis=-1, output_type=tf.int32) # shape [batch_size, decoder_cur_len]
             cur_outputs = outputs[:, -1] # shape [batch_size]
             finished = tf.maximum(finished, tf.cast(tf.equal(cur_outputs, self.EOS), finished.dtype))
-            return fed_inputs, alignments, outputs, finished, i
+            return fed_inputs, attention_weights, outputs, finished, i
 
-        fed_inputs, alignments, outputs, _, _ = tf.while_loop(continue_decode, step, list(initial_variables.values()), shape_invariants=list(variables_shape.values()))
-        return fed_inputs, alignments, outputs
+        fed_inputs, attention_weights, outputs, _, _ = tf.while_loop(continue_decode, step, list(initial_variables.values()), shape_invariants=list(variables_shape.values()))
+        return fed_inputs, attention_weights, outputs
         
     def beam_search_decode(self, encoder_outputs, encoder_states, attention_mask, beam_size, coverage_penalty_weight, length_penalty_weight, extra_decode_length=20):
         beam_size = beam_size
@@ -112,7 +110,7 @@ class RNN_Seq2Seq:
         MAX_LENGTH = encode_length + extra_decode_length
         initial_variables = {
             "FED_INPUTS" : tf.fill([batch_size*beam_size, 1], self.GO),
-            "ALIGNMENTS": tf.zeros([batch_size*beam_size, 1, encode_length]),
+            "ATTENTION_WEIGHTS": tf.zeros([batch_size*beam_size, 1, encode_length]),
             "OUTPUTS" : tf.zeros([batch_size*beam_size, 1], tf.int32),
             "FINISHED" : tf.zeros([batch_size*beam_size], tf.int32),
             "SCORES": tf.zeros([batch_size, beam_size*self.TARGET_VOCAB_SIZE]),
@@ -122,7 +120,7 @@ class RNN_Seq2Seq:
         encode_length_dim = encoder_outputs.shape[1]
         variables_shape = {
             "FED_INPUTS" : tf.TensorShape([batch_size_dim*beam_size, None]),
-            "ALIGNMENTS" : tf.TensorShape([batch_size_dim*beam_size, None, encode_length_dim]),
+            "ATTENTION_WEIGHTS" : tf.TensorShape([batch_size_dim*beam_size, None, encode_length_dim]),
             "OUTPUTS": tf.TensorShape([batch_size_dim*beam_size, None]),
             "FINISHED": tf.TensorShape([batch_size_dim*beam_size]),
             "SCORES": tf.TensorShape([batch_size_dim, beam_size*self.TARGET_VOCAB_SIZE]),
@@ -140,7 +138,7 @@ class RNN_Seq2Seq:
             p = tf.reshape(params, [indices_size, -1])
             return tf.reshape(tf.gather_nd(p, i), indices_shape)
 
-        def compute_score(i, prev_outputs, logits, sequence_length, alignments, fed_inputs):
+        def compute_score(i, prev_outputs, logits, sequence_length, attention_weights, fed_inputs):
             cur_softmax = tf.nn.softmax(logits[:, -1:, :])
             cur_probabilities = tf.transpose(cur_softmax, [0, 2, 1])
             def generate_probabilities():
@@ -156,8 +154,8 @@ class RNN_Seq2Seq:
             length_penalty = tf.pow((5.0 + tf.to_float(sequence_length))/(5.0 + 1.0), length_penalty_weight)
             
             unpadded_pos = tf.cast(tf.not_equal(fed_inputs, self.PAD), tf.float32)
-            masked_alignments = tf.expand_dims(unpadded_pos, -1)*alignments
-            coverage_penalty = coverage_penalty_weight*tf.reduce_sum(tf.log(tf.minimum(tf.reduce_sum(masked_alignments, 1), 1.0)), -1) # shape [batch_size*beam_size]
+            masked_attention_weights = tf.expand_dims(unpadded_pos, -1)*attention_weights
+            coverage_penalty = coverage_penalty_weight*tf.reduce_sum(tf.log(tf.minimum(tf.reduce_sum(masked_attention_weights, 1), 1.0)), -1) # shape [batch_size*beam_size]
 
             scores = tf.log(probabilities)/tf.expand_dims(length_penalty, -1) + tf.expand_dims(coverage_penalty, -1)
             scores = tf.reshape(scores, [batch_size, beam_size*self.TARGET_VOCAB_SIZE])
@@ -173,10 +171,10 @@ class RNN_Seq2Seq:
             outputs = tf.cond(tf.equal(i, 1), lambda: top_ids, lambda: tf.concat([tf.gather(outputs, top_beams), top_ids], -1))
             return outputs
 
-        def continue_decode(fed_inputs, alignments, outputs, finished, scores, i):
+        def continue_decode(fed_inputs, attention_weights, outputs, finished, scores, i):
             return tf.logical_and(tf.less(tf.reduce_sum(finished), tf.size(finished)), tf.less(tf.shape(outputs)[1], MAX_LENGTH))
             
-        def step(fed_inputs, alignments, outputs, finished, scores, i):
+        def step(fed_inputs, attention_weights, outputs, finished, scores, i):
             i += 1
             cur_outputs = outputs[:, -1] # shape [batch_size*beam_size]
             next_ids = (1 - finished) * cur_outputs + finished * self.PAD
@@ -184,17 +182,17 @@ class RNN_Seq2Seq:
             sequence_length = self.get_sequence_length(fed_inputs)
             inputs = self.target_embedding_layer(fed_inputs)
             decoder_outputs, states = self.decoder(inputs, sequence_length)
-            attention_layer_outputs, alignments = self.attention_layer(encoder_outputs, decoder_outputs, attention_mask) # shape [batch_size*beam_size, decoder_cur_len, 2*rnn_dim]
+            attention_layer_outputs, attention_weights = self.attention_layer(encoder_outputs, decoder_outputs, attention_mask) # shape [batch_size*beam_size, decoder_cur_len, 2*rnn_dim]
             projected_outputs = self.projection_layer(attention_layer_outputs) 
             logits = self.target_embedding_layer.linear(projected_outputs) # shape [batch_size*beam_size, decoder_cur_len, target_vocab_size]
-            scores = compute_score(i, outputs, logits, sequence_length, alignments, fed_inputs) 
+            scores = compute_score(i, outputs, logits, sequence_length, attention_weights, fed_inputs) 
             outputs = generate_outputs(i, outputs, scores, beam_size)
             cur_outputs = outputs[:, -1]
             finished = tf.maximum(finished, tf.cast(tf.equal(cur_outputs, self.EOS), finished.dtype))
-            return fed_inputs, alignments, outputs, finished, scores, i
-        fed_inputs, alignments, outputs, _, scores, i = tf.while_loop(continue_decode, step, list(initial_variables.values()), shape_invariants=list(variables_shape.values()))
+            return fed_inputs, attention_weights, outputs, finished, scores, i
+        fed_inputs, attention_weights, outputs, _, scores, i = tf.while_loop(continue_decode, step, list(initial_variables.values()), shape_invariants=list(variables_shape.values()))
         outputs = generate_outputs(i, outputs[:, :-1], scores, 1)
-        return fed_inputs, alignments, outputs
+        return fed_inputs, attention_weights, outputs
 
     def get_sequence_length(self, id_seqs): # shape [batch_size, max_len]
         unpadded_pos = tf.cast(tf.not_equal(id_seqs, self.PAD), tf.int32)

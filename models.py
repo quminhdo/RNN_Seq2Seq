@@ -252,7 +252,7 @@ class Inference_Model:
 #        output_dict = seq2seq(inputs)
         output_dict = seq2seq(inputs, length_penalty_weight=self.base_params["length_penalty_weight"], coverage_penalty_weight=self.base_params["coverage_penalty_weight"], beam_size=self.base_params["beam_size"])
         fed_inputs = output_dict["fed_inputs"]
-        self.alignments = output_dict["alignments"]
+        self.attention_weights = output_dict["attention_weights"]
         outputs = output_dict["outputs"]
         self.outputs = self.target_converter.id2word(outputs)
         self.fed_inputs = self.target_converter.id2word(fed_inputs)
@@ -264,12 +264,12 @@ class Inference_Model:
     def __call__(self, inputs): 
         tokenized_inputs = self.process_inputs(inputs)
 #        print(tokenized_inputs)
-        outputs, fed_inputs, alignments = self.sess.run((self.outputs, self.fed_inputs, self.alignments), feed_dict={self.input_holder:tokenized_inputs})
+        outputs, fed_inputs, attention_weights = self.sess.run((self.outputs, self.fed_inputs, self.attention_weights), feed_dict={self.input_holder:tokenized_inputs})
 #        self.check_inference(id_inputs, id_outputs)
         outputs, tokenized_outputs = self.process_output(outputs)
 #        _, tokenized_fed_inputs = self.process_output(fed_inputs)
 #        print(tokenized_fed_inputs)
-        return outputs, tokenized_inputs, tokenized_outputs, alignments
+        return outputs, tokenized_inputs, tokenized_outputs, attention_weights
 
     def check_inference(self, id_inputs, id_outputs):
         print("ID inputs")
