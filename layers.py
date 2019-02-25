@@ -1,7 +1,4 @@
 import tensorflow as tf
-import numpy as np
-import math 
-import utils
 
 class Embedding_Layer:
     def __init__(self, vocab_size, embedding_dim, scope_name):
@@ -78,8 +75,8 @@ class Attention_Layer:
         k = self.key_proj_layer(encoder_outputs) # shape [batch_size, encoder_max_len, attention_dim]
         v = encoder_outputs
         qk = tf.matmul(q, k, transpose_b=True) 
-        alignments = tf.nn.softmax(qk + attention_mask) # shape [batch_size, decoder_max_len, encoder_max_len]
-        context = tf.matmul(alignments, v) # shape [batch_size, decoder_max_len, rnn_dim]
+        attention_weights = tf.nn.softmax(qk + attention_mask) # shape [batch_size, decoder_max_len, encoder_max_len]
+        context = tf.matmul(attention_weights, v) # shape [batch_size, decoder_max_len, rnn_dim]
         outputs = tf.concat((context, decoder_outputs), -1) # shape [batch_size, decoder_max_len, 2*rnn_dim]
-        return outputs, alignments
+        return outputs, attention_weights
     
